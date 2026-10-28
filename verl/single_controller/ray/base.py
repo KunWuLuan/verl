@@ -120,6 +120,7 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
         slot_states: Optional[dict] = None,
+        pg_process_counts: Optional[dict[str, int]] = None,
     ) -> None:
         # TPU claims a chip exclusively per process, so colocating more than one
         # WorkerGroup builds a placement group that can never be satisfied.
@@ -135,12 +136,15 @@ class RayResourcePool(ResourcePool):
         # Shared by pool views in the owning driver. Marking a slot does not
         # release its PG or change rank numbering for an existing worker group.
         self._slot_states = slot_states if slot_states is not None else {}
+        self._pg_process_counts = pg_process_counts if pg_process_counts is not None else {}
 
     def resource_slots(self):
         """Return this view's (PG, bundle index) slots without allocating GPUs."""
         if self.pgs is None:
             raise RuntimeError("resource pool must be initialized before accessing slots")
-        slots = [(pg, index) for pg, count in zip(self.pgs, self.store, strict=True) for index in range(count)]
+        slots = [
+            (pg, index) for pg in self.pgs for index in range(self._pg_process_counts.get(pg.id.hex(), pg.bundle_count))
+        ]
         for pg in self.pgs:
             self._slot_states.setdefault(pg.id.hex(), {})
         if isinstance(self, SubRayResourcePool):
@@ -216,6 +220,9 @@ class RayResourcePool(ResourcePool):
 
         ray.get([pg.ready() for pg in pgs])
 
+        self._pg_process_counts = {
+            pg.id.hex(): process_count for pg, process_count in zip(pgs, self._store, strict=True)
+        }
         self.pgs = sort_placement_group_by_node_ip(pgs)
         return pgs
 
@@ -327,6 +334,9 @@ def extract_pg_from_exist(
         searching_idx += 1
 
     selected = [pg for _, pg in sorted(unsorted_pgs)]
+    resource_pool._pg_process_counts = {
+        pg.id.hex(): resource_pool.store[original_idx] for original_idx, pg in unsorted_pgs
+    }
     for role, source in resource_pools.items():
         if role in src_role_names:
             source.resource_slots()
@@ -381,6 +391,7 @@ def split_resource_pool(
             start_bundle_index=start_bundle_idx_list[split_idx],
             subgroup_world_size=split_size_list[split_idx],
             slot_states=resource_pool._slot_states,
+            pg_process_counts=resource_pool._pg_process_counts,
         )
         for split_idx in range(len(split_size_list))
     ]
@@ -406,6 +417,7 @@ def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResour
     if {pg.id.hex() for pg in rp1.pgs} & {pg.id.hex() for pg in rp2.pgs}:
         raise ValueError("cannot merge resource pools with overlapping placement groups")
     merged._slot_states = {**rp1._slot_states, **rp2._slot_states}
+    merged._pg_process_counts = {**rp1._pg_process_counts, **rp2._pg_process_counts}
 
     return merged
 

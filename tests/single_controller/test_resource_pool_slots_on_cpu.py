@@ -14,7 +14,7 @@
 """Driver-local slot health: no recovery controller, cluster or accelerator required."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import ray
@@ -44,7 +44,7 @@ class SlotProbe(Worker):
 def make_pool(name="pool", counts=(2,)):
     pool = RayResourcePool(list(counts))
     pool.pgs = [
-        SimpleNamespace(id=SimpleNamespace(hex=lambda i=i: f"{name}-{i}"), bundle_count=count)
+        SimpleNamespace(id=SimpleNamespace(hex=lambda i=i: f"{name}-{i}"), bundle_count=count, ready=Mock())
         for i, count in enumerate(counts)
     ]
     return pool
@@ -61,6 +61,28 @@ def test_marking_one_slot_keeps_other_slots_and_pg():
     assert pool.is_slot_available(pool.pgs[1], 1)
     assert pool.world_size == 4
     assert pool.get_placement_groups()[0] is pg
+
+
+def test_unequal_bundle_counts_stay_associated_when_pgs_are_reordered():
+    pool = RayResourcePool([1, 2], use_gpu=False)
+    one_bundle, two_bundles = make_pool(counts=(1, 2)).pgs
+    with (
+        patch("verl.single_controller.ray.base.placement_group", side_effect=[one_bundle, two_bundles]),
+        patch("verl.single_controller.ray.base.ray.get"),
+        patch(
+            "verl.single_controller.ray.base.sort_placement_group_by_node_ip",
+            return_value=[two_bundles, one_bundle],
+        ),
+    ):
+        pool.get_placement_groups()
+
+    assert [(pg.id.hex(), index) for pg, index in pool.resource_slots()] == [
+        (two_bundles.id.hex(), 0),
+        (two_bundles.id.hex(), 1),
+        (one_bundle.id.hex(), 0),
+    ]
+    pool.mark_slot_unavailable(two_bundles, 1, "device_failed")
+    assert not pool.is_slot_available(two_bundles, 1)
 
 
 @pytest.mark.parametrize("index", [-1, 2])
