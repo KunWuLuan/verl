@@ -17,14 +17,28 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import ray
 
+from verl.single_controller.base.worker import Worker
 from verl.single_controller.ray.base import (
+    RayClassWithInitArgs,
     RayResourcePool,
     RayWorkerGroup,
     extract_pg_from_exist,
     merge_resource_pool,
     split_resource_pool,
 )
+
+
+@ray.remote
+class SlotProbe(Worker):
+    def placement(self):
+        context = ray.get_runtime_context()
+        return {
+            "actor_id": context.get_actor_id(),
+            "node_id": context.get_node_id(),
+            "placement_group_id": context.get_placement_group_id(),
+        }
 
 
 def make_pool(name="pool", counts=(2,)):
@@ -142,3 +156,40 @@ def test_healthy_subpool_launch_keeps_original_bundle_index():
     worker_group._create_worker.assert_called_once()
     assert worker_group._create_worker.call_args.kwargs["local_rank"] == 1
     assert worker_group._create_worker.call_args.kwargs["pg"] is pool.pgs[0]
+
+
+def test_real_cpu_placement_group_rejects_bad_slot_and_launches_on_healthy_slot():
+    ray.init(num_cpus=4)
+    pool = RayResourcePool([2], use_gpu=False, max_colocate_count=1, name_prefix="slot_integration_")
+    worker_group = None
+    try:
+        pg = pool.get_placement_groups(strategy="STRICT_PACK")[0]
+        bad_pool, healthy_pool = split_resource_pool(pool, [1, 1])
+        pool.mark_slot_unavailable(pg, 0, reason="integration_test_fault")
+
+        with pytest.raises(RuntimeError, match="integration_test_fault"):
+            RayWorkerGroup(
+                bad_pool,
+                RayClassWithInitArgs(cls=SlotProbe),
+                name_prefix="bad_slot_",
+            )
+
+        worker_group = RayWorkerGroup(
+            healthy_pool,
+            RayClassWithInitArgs(cls=SlotProbe),
+            name_prefix="healthy_slot_",
+        )
+        placement = worker_group.execute_all_sync("placement")
+        assert len(placement) == 1
+        assert placement[0]["actor_id"]
+        assert placement[0]["node_id"]
+        assert placement[0]["placement_group_id"] == pg.id.hex()
+        assert healthy_pool.is_slot_available(pg, 1)
+    finally:
+        if worker_group is not None:
+            for worker in worker_group._workers:
+                ray.kill(worker)
+        if pool.pgs is not None:
+            for pg in pool.pgs:
+                ray.util.remove_placement_group(pg)
+        ray.shutdown()
