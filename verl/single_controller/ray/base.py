@@ -119,6 +119,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        slot_states: Optional[dict] = None,
     ) -> None:
         # TPU claims a chip exclusively per process, so colocating more than one
         # WorkerGroup builds a placement group that can never be satisfied.
@@ -131,6 +132,54 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        # Shared by pool views in the owning driver. Marking a slot does not
+        # release its PG or change rank numbering for an existing worker group.
+        self._slot_states = slot_states if slot_states is not None else {}
+
+    def resource_slots(self):
+        """Return this view's (PG, bundle index) slots without allocating GPUs."""
+        if self.pgs is None:
+            raise RuntimeError("resource pool must be initialized before accessing slots")
+        slots = [(pg, index) for pg, count in zip(self.pgs, self.store, strict=True) for index in range(count)]
+        for pg in self.pgs:
+            self._slot_states.setdefault(pg.id.hex(), {})
+        if isinstance(self, SubRayResourcePool):
+            slots = slots[self.start_bundle_index : self.start_bundle_index + self.world_size]
+        return slots
+
+    def mark_slot_unavailable(self, pg, bundle_index, reason="device_unhealthy"):
+        """Prevent future VeRL worker launches on a slot without releasing its PG.
+
+        The owning driver shares this mark with pool views. It does not stop
+        existing actors, change Ray scheduling, or persist across driver restarts.
+        """
+        if not reason:
+            raise ValueError("unavailable slot requires a reason")
+        key = (pg.id.hex(), bundle_index)
+        if key not in {(p.id.hex(), index) for p, index in self.resource_slots()}:
+            raise ValueError("slot is outside this resource pool view")
+        self._slot_states[key[0]][bundle_index] = reason
+
+    def is_slot_available(self, pg, bundle_index):
+        """Check a slot belonging to this pool view; reject out-of-view queries."""
+        key = (pg.id.hex(), bundle_index)
+        if key not in {(p.id.hex(), index) for p, index in self.resource_slots()}:
+            raise ValueError("slot is outside this resource pool view")
+        return bundle_index not in self._slot_states[key[0]]
+
+    def unavailable_slots(self):
+        """Return marked slots in this view, with PG IDs and diagnostic reasons."""
+        return [
+            {"pg_id": pg.id.hex(), "bundle_index": index, "reason": self._slot_states[pg.id.hex()][index]}
+            for pg, index in self.resource_slots()
+            if index in self._slot_states[pg.id.hex()]
+        ]
+
+    def assert_slots_available(self):
+        """Fail before launch rather than silently shrinking a worker group's world size."""
+        unavailable = self.unavailable_slots()
+        if unavailable:
+            raise RuntimeError(f"resource pool contains unavailable GPU slots: {unavailable}")
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -277,7 +326,14 @@ def extract_pg_from_exist(
         unsorted_pgs.append((original_idx, sorted_src_pgs[searching_idx]))
         searching_idx += 1
 
-    return [pg for _, pg in sorted(unsorted_pgs)]
+    selected = [pg for _, pg in sorted(unsorted_pgs)]
+    for role, source in resource_pools.items():
+        if role in src_role_names:
+            source.resource_slots()
+            for pg in selected:
+                if pg.id.hex() in source._slot_states:
+                    resource_pool._slot_states[pg.id.hex()] = source._slot_states[pg.id.hex()]
+    return selected
 
 
 # split a RayResourcePool or SubRayResourcePool into multiple SubRayResourcePool
@@ -324,6 +380,7 @@ def split_resource_pool(
             placement_groups=placement_groups,
             start_bundle_index=start_bundle_idx_list[split_idx],
             subgroup_world_size=split_size_list[split_idx],
+            slot_states=resource_pool._slot_states,
         )
         for split_idx in range(len(split_size_list))
     ]
@@ -344,6 +401,11 @@ def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResour
     merged.pgs = rp1.get_placement_groups(device_name=get_device_name()) + rp2.get_placement_groups(
         device_name=get_device_name()
     )
+    rp1.resource_slots()
+    rp2.resource_slots()
+    if {pg.id.hex() for pg in rp1.pgs} & {pg.id.hex() for pg in rp2.pgs}:
+        raise ValueError("cannot merge resource pools with overlapping placement groups")
+    merged._slot_states = {**rp1._slot_states, **rp2._slot_states}
 
     return merged
 
@@ -568,6 +630,7 @@ class RayWorkerGroup(WorkerGroup):
         if bin_pack:
             strategy = "STRICT_PACK"
         pgs = resource_pool.get_placement_groups(strategy=strategy, device_name=self.device_name)
+        resource_pool.assert_slots_available()
         world_size = resource_pool.world_size
         self._world_size = world_size
         # cia.add_kwarg("_world_size", world_size)
@@ -604,6 +667,7 @@ class RayWorkerGroup(WorkerGroup):
         if bin_pack:
             strategy = "STRICT_PACK"
         pgs = resource_pool.get_placement_groups(strategy=strategy, device_name=self.device_name)
+        resource_pool.assert_slots_available()
         world_size = resource_pool.world_size
         self._world_size = world_size
 

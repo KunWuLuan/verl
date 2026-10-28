@@ -1,0 +1,144 @@
+# Copyright 2026 verl contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Driver-local slot health: no recovery controller, cluster or accelerator required."""
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from verl.single_controller.ray.base import (
+    RayResourcePool,
+    RayWorkerGroup,
+    extract_pg_from_exist,
+    merge_resource_pool,
+    split_resource_pool,
+)
+
+
+def make_pool(name="pool", counts=(2,)):
+    pool = RayResourcePool(list(counts))
+    pool.pgs = [
+        SimpleNamespace(id=SimpleNamespace(hex=lambda i=i: f"{name}-{i}"), bundle_count=count)
+        for i, count in enumerate(counts)
+    ]
+    return pool
+
+
+def test_marking_one_slot_keeps_other_slots_and_pg():
+    pool = make_pool(counts=(2, 2))
+    pg = pool.pgs[0]
+    pool.mark_slot_unavailable(pg, 1, "device_failed")
+    pool.mark_slot_unavailable(pg, 1, "device_failed")
+    assert pool.unavailable_slots() == [{"pg_id": "pool-0", "bundle_index": 1, "reason": "device_failed"}]
+    assert pool.is_slot_available(pg, 0)
+    assert not pool.is_slot_available(pg, 1)
+    assert pool.is_slot_available(pool.pgs[1], 1)
+    assert pool.world_size == 4
+    assert pool.get_placement_groups()[0] is pg
+
+
+@pytest.mark.parametrize("index", [-1, 2])
+def test_out_of_range_slot_is_rejected(index):
+    pool = make_pool()
+    with pytest.raises(ValueError, match="outside"):
+        pool.mark_slot_unavailable(pool.pgs[0], index)
+    with pytest.raises(ValueError, match="outside"):
+        pool.is_slot_available(pool.pgs[0], index)
+
+
+def test_unknown_pg_and_empty_reason_are_rejected():
+    pool, foreign = make_pool(), make_pool("foreign")
+    with pytest.raises(ValueError, match="outside"):
+        pool.mark_slot_unavailable(foreign.pgs[0], 0)
+    with pytest.raises(ValueError, match="reason"):
+        pool.mark_slot_unavailable(pool.pgs[0], 0, "")
+    assert not pool.unavailable_slots()
+
+
+def test_slot_queries_do_not_allocate_uninitialized_pool():
+    pool = RayResourcePool([2])
+    with pytest.raises(RuntimeError, match="initialized"):
+        pool.resource_slots()
+    assert pool.pgs is None
+
+
+def test_split_and_nested_views_share_masks_in_both_directions():
+    pool = make_pool(counts=(2, 2))
+    first, second = split_resource_pool(pool, 2)
+    healthy, bad = split_resource_pool(second, 1)
+    bad.mark_slot_unavailable(pool.pgs[1], 1)
+    assert not pool.is_slot_available(pool.pgs[1], 1)
+    first.assert_slots_available()
+    healthy.assert_slots_available()
+    with pytest.raises(RuntimeError, match="unavailable"):
+        second.assert_slots_available()
+    with pytest.raises(ValueError, match="outside"):
+        first.mark_slot_unavailable(pool.pgs[1], 1)
+    pool.mark_slot_unavailable(pool.pgs[1], 0)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        healthy.assert_slots_available()
+
+
+def test_merge_shares_later_marks_with_source_pools():
+    left, right = make_pool("left"), make_pool("right")
+    merged = merge_resource_pool(left, right)
+    right.mark_slot_unavailable(right.pgs[0], 1)
+    assert len(merged.unavailable_slots()) == 1
+    merged.mark_slot_unavailable(left.pgs[0], 0)
+    assert not left.is_slot_available(left.pgs[0], 0)
+
+
+def test_overlapping_pg_merge_is_rejected():
+    pool = make_pool()
+    with pytest.raises(ValueError, match="overlapping"):
+        merge_resource_pool(pool, pool)
+
+
+def test_extract_preserves_marks_before_and_after_reuse():
+    source, target = make_pool(), RayResourcePool([2])
+    source.mark_slot_unavailable(source.pgs[0], 0)
+    target.pgs = extract_pg_from_exist({"actor": source}, ["actor"], target)
+    assert len(target.unavailable_slots()) == 1
+    target.mark_slot_unavailable(target.pgs[0], 1)
+    assert len(source.unavailable_slots()) == 2
+
+
+@pytest.mark.parametrize("subpool", [False, True])
+def test_worker_launch_fails_before_master_or_actor_creation(subpool):
+    pool = make_pool()
+    pool.mark_slot_unavailable(pool.pgs[0], 0)
+    worker_group = SimpleNamespace(device_name="cuda", _get_master_addr_port=Mock(), _create_worker=Mock())
+    initializer = RayWorkerGroup._init_with_resource_pool
+    if subpool:
+        pool = split_resource_pool(pool, 1)[0]
+        initializer = RayWorkerGroup._init_with_subresource_pool
+    with pytest.raises(RuntimeError, match="unavailable"):
+        initializer(worker_group, pool, None, False, False)
+    worker_group._get_master_addr_port.assert_not_called()
+    worker_group._create_worker.assert_not_called()
+
+
+def test_healthy_subpool_launch_keeps_original_bundle_index():
+    pool = make_pool()
+    pool.mark_slot_unavailable(pool.pgs[0], 0)
+    healthy = split_resource_pool(pool, 1)[1]
+    worker_group = SimpleNamespace(
+        device_name="cuda", _get_master_addr_port=Mock(), _create_worker=Mock(), _ray_master_port_range=None
+    )
+    RayWorkerGroup._init_with_subresource_pool(worker_group, healthy, None, False, False)
+    assert worker_group._world_size == 1
+    worker_group._create_worker.assert_called_once()
+    assert worker_group._create_worker.call_args.kwargs["local_rank"] == 1
+    assert worker_group._create_worker.call_args.kwargs["pg"] is pool.pgs[0]
