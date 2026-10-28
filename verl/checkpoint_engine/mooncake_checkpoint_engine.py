@@ -225,6 +225,8 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         }
         self.store.send_obj(info, 1)
         await self.wait_for_complete(magic_slots[idx])
+        if should_wait:
+            await self.wait_for_complete(magic_slots[idx ^ 1])
 
         time_cost = time.time() - start_time
         bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024)
@@ -268,7 +270,10 @@ class MooncakeCheckpointEngine(CheckpointEngine):
             prev_magic_ptr = info.get("magic_ptr")
 
             ret = self.engine.transfer_sync_read(
-                self.buffer_info["session_id"], current.data_ptr(), prev_ptr, info["len"],
+                self.buffer_info["session_id"],
+                current.data_ptr(),
+                prev_ptr,
+                info["len"],
             )
             assert ret == 0
 
@@ -289,12 +294,18 @@ class MooncakeCheckpointEngine(CheckpointEngine):
 
             if prev_magic_ptr is not None:
                 ret = self.engine.transfer_sync_write(
-                    self.buffer_info["session_id"], self.magic_buf.data_ptr(), prev_magic_ptr, 4,
+                    self.buffer_info["session_id"],
+                    self.magic_buf.data_ptr(),
+                    prev_magic_ptr,
+                    4,
                 )
                 assert ret == 0
             else:
                 ret = self.engine.transfer_sync_write(
-                    self.buffer_info["session_id"], self.magic_buf.data_ptr(), prev_ptr, 4,
+                    self.buffer_info["session_id"],
+                    self.magic_buf.data_ptr(),
+                    prev_ptr,
+                    4,
                 )
                 assert ret == 0
 
@@ -304,6 +315,10 @@ class MooncakeCheckpointEngine(CheckpointEngine):
 
             if info["is_last"]:
                 break
+
+        if self.rank < self.world_size - 1:
+            for slot in range(min(idx, 2)):
+                await self.wait_for_complete(magic_slots[slot])
 
         time_cost = time.time() - start_time
         bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024)
