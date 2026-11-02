@@ -23,9 +23,10 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 RUNTIME_EXTENSION_API_VERSION = 1
+T = TypeVar("T")
 
 
 class RuntimeCapability(str, Enum):
@@ -233,6 +234,28 @@ class RuntimeExtensionRegistry:
         event = RuntimeEvent(topic=topic, payload=payload)
         self.events.publish(event)
         return event
+
+    def run_fit_lifecycle(self, fit: Callable[[], T]) -> T:
+        """Run a fit callback while completing every lifecycle exit path."""
+        try:
+            self.reach(SafePoint.BEFORE_FIT)
+            self.publish("trainer.fit.started")
+            return fit()
+        except BaseException as error:
+            try:
+                self.publish(
+                    "trainer.fit.failed",
+                    error_type=type(error).__name__,
+                    message=str(error),
+                )
+            finally:
+                self.reach(SafePoint.TERMINAL_FAILURE)
+            raise
+        finally:
+            try:
+                self.reach(SafePoint.AFTER_FIT)
+            finally:
+                self.publish("trainer.fit.finished")
 
     def close(self) -> None:
         """Close all registrations."""

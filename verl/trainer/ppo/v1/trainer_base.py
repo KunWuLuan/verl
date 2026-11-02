@@ -451,21 +451,7 @@ class PPOTrainer(ABC):
         """Run training while notifying registered runtime extensions."""
         if not self.runtime_extensions:
             return self._fit(agent_loop_manager)
-        self.runtime_extensions.reach(SafePoint.BEFORE_FIT)
-        self.runtime_extensions.publish("trainer.fit.started")
-        try:
-            return self._fit(agent_loop_manager)
-        except BaseException as error:
-            self.runtime_extensions.publish(
-                "trainer.fit.failed",
-                error_type=type(error).__name__,
-                message=str(error),
-            )
-            self.runtime_extensions.reach(SafePoint.TERMINAL_FAILURE)
-            raise
-        finally:
-            self.runtime_extensions.reach(SafePoint.AFTER_FIT)
-            self.runtime_extensions.publish("trainer.fit.finished")
+        return self.runtime_extensions.run_fit_lifecycle(lambda: self._fit(agent_loop_manager))
 
     def _fit(self, agent_loop_manager: AgentLoopManager):
         """Fit the trainer with the agent loop manager.
